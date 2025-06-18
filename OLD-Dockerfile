@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+# Copyright (c) 2024-2025, NVIDIA CORPORATION.
+
+ARG CUDA_VER=12.8.0
+ARG PYTHON_VER=3.11
+ARG LINUX_VER=ubuntu22.04
+ARG RAPIDS_VER=25.02
+
+FROM rapidsai/miniforge-cuda:cuda${CUDA_VER}-base-${LINUX_VER}-py${PYTHON_VER} AS cuvs-bench
+ARG CUDA_VER
+ARG RAPIDS_VER
+
+# COPY condarc /opt/conda/.condarc
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+# Create a data folder accessible by any user so mounted volumes under it can be accessible
+# when the user passes their uid to docker run with -u $(id -u)
+# Also add the conda_prefix config to the global bashrc file so that all users have it correctly configured.
+RUN <<EOF
+mkdir /myworkspace
+chmod 777 /myworkspace
+echo ". /opt/conda/etc/profile.d/conda.sh; conda activate base" >> /etc/bash.bashrc
+EOF
+
+RUN <<EOF
+apt-get update
+apt-get install -y --no-install-recommends \
+  wget git pip nano ninja-build maven curl zip httpie lsof
+wget --quiet https://github.com/rapidsai/gha-tools/releases/latest/download/tools.tar.gz -O - | tar -xz -C /usr/local/bin
+rm -rf /var/lib/apt/lists/*
+pip install cmake==3.30.4
+wget https://download.oracle.com/java/22/archive/jdk-22.0.2_linux-x64_bin.deb
+dpkg -i jdk-22.0.2_linux-x64_bin.deb
+export JAVA_HOME=/usr/lib/jvm/jdk-22.0.2-oracle-x64
+EOF
+
+RUN <<EOF
+rapids-mamba-retry update --all -y -n base
+rapids-mamba-retry install -y -n base -c rapidsai -c conda-forge -c nvidia \
+    "cuvs-bench=${RAPIDS_VER}.*" \
+    "cuda-version=${CUDA_VER%.*}.*"
+conda clean -afy
+chmod -R 777 /opt/conda
+EOF
+
+# We add rapids is the default user in case the user runs without -u,
+# but users are encouraged to  use the -u docker run flag to write/read to mounted volumes.
+RUN useradd -rm -d /home/rapids -s /bin/bash -g conda -u 1001 rapids
+USER rapids
+WORKDIR /myworkspace
+
+ENTRYPOINT ["/bin/bash"]

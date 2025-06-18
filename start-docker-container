@@ -1,0 +1,26 @@
+sudo mount /dev/nvme0n2 /raid
+cd /raid/solr-dev
+
+IMAGE_NAME="nvidia/cuda:12.8.1-devel-ubuntu22.04"
+HOST_DIR=$(pwd)  # Current directory
+CONTAINER_DIR="/myworkspace"
+
+docker run -it --rm \
+    --net=host \
+    --gpus all \
+    -u root \
+    -v "${HOST_DIR}:${CONTAINER_DIR}" \
+    --entrypoint bash \
+    "${IMAGE_NAME}"
+
+cd /myworkspace
+apt update
+apt install -y libnccl2 libnccl-dev --allow-change-held-packages
+
+apt install -y htop nvtop wget git pip nano ninja-build maven curl zip httpie lsof --allow-change-held-packages
+wget -nc https://download.oracle.com/java/22/archive/jdk-22.0.2_linux-x64_bin.deb
+dpkg -i jdk-22.0.2_linux-x64_bin.deb
+export JAVA_HOME=/usr/lib/jvm/jdk-22.0.2-oracle-x64
+
+pip install cmake==3.30.4 jpype1 numpy pandas jupyterlab tqdm
+jupyter lab --allow-root

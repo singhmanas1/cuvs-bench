@@ -53,7 +53,7 @@ public class Indexer {
                     if(!writeBatch(batchSz, br, codec, p.isLegacy)) break;
                     System.out.println(name);
                     count+= batchSz;
-                    if(count > docsCount) break;
+                    if(count >= docsCount) break;
                 }
             }
         }
