@@ -1,11 +1,33 @@
 Prerequisites
 =============
 
-* Install CUDA (12.6 or 12.8)
+* Docker with NVIDIA Container Runtime
+* NVIDIA GPU with CUDA 12.6 or 12.8 support
+* NVIDIA drivers installed
 * Install CMake 3.30+
 * apt install ninja-build libnccl-dev httpie curl
 * Install JDK 22
 * Install Maven 3.9.6+
+
+Development Environment Setup
+===========================
+
+We provide a containerized development environment with all necessary dependencies pre-configured. To use it:
+
+1. Start the development container:
+   ```bash
+   sudo ./scripts/start-dev-environment.sh
+   ```
+
+2. Once inside the container, set up the environment:
+   ```bash
+   ./scripts/setup-container.sh
+   ```
+
+3. Start Jupyter Lab (optional):
+   ```bash
+   jupyter lab --allow-root --ip 0.0.0.0 --no-browser
+   ```
 
 Building cuVS 25.02
 ===================

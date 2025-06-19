@@ -7,6 +7,11 @@ import time
 import re
 import requests
 from functools import wraps
+import importlib
+import cuvs
+import pylibraft
+import warnings
+
 
 def generate_config_xml(model_name, params, output_dir='./tmp_config'):
     """
@@ -303,3 +308,226 @@ def load_query_vectors(data_file, num_queries=8192, jar_classpath='./solr-cuvs-b
     query_vectors = [re.sub(r'[ \n]+', '', str(obj[ii]['article_vector'].toArray())) for ii in range(num_queries)]
     print('Successfully loaded query vectors.')
     return(ids, query_vectors)
+
+def calc_recall(found_indices, ground_truth):
+    found_indices = xp.asarray(found_indices)
+    bs, k = found_indices.shape
+    if bs != ground_truth.shape[0]:
+        raise RuntimeError(
+            "Batch sizes do not match {} vs {}".format(
+                bs, ground_truth.shape[0]
+            )
+        )
+    if k > ground_truth.shape[1]:
+        raise RuntimeError(
+            "Not enough indices in the ground truth ({} > {})".format(
+                k, ground_truth.shape[1]
+            )
+        )
+    n = 0
+    # Go over the batch
+    for i in range(bs):
+        # Note, ivf-pq does not guarantee the ordered input, hence the use of intersect1d
+        n += xp.intersect1d(found_indices[i, :k], ground_truth[i, :k]).size
+        # To-do: Change to account for equidistant indices that are not captured.
+    
+    #recall = n / found_indices.size
+    recall = n / (bs * ground_truth.shape[1])
+    return recall
+
+def import_with_fallback(primary_lib, secondary_lib=None, alias=None):
+    """
+    Attempt to import a primary library, with an optional fallback to a
+    secondary library.
+    Optionally assigns the imported module to a global alias.
+
+    Parameters
+    ----------
+    primary_lib : str
+        Name of the primary library to import.
+    secondary_lib : str, optional
+        Name of the secondary library to use as a fallback. If `None`,
+        no fallback is attempted.
+    alias : str, optional
+        Alias to assign the imported module globally.
+
+    Returns
+    -------
+    module or None
+        The imported module if successful; otherwise, `None`.
+
+    Examples
+    --------
+    >>> xp = import_with_fallback('cupy', 'numpy')
+    >>> mod = import_with_fallback('nonexistent_lib')
+    >>> if mod is None:
+    ...     print("Library not found.")
+    """
+    try:
+        module = importlib.import_module(primary_lib)
+    except ImportError:
+        if secondary_lib is not None:
+            try:
+                module = importlib.import_module(secondary_lib)
+            except ImportError:
+                module = None
+        else:
+            module = None
+    if alias and module is not None:
+        globals()[alias] = module
+    return module
+
+xp = import_with_fallback("cupy", "numpy")
+rmm = import_with_fallback("rmm")
+gpu_system = False
+
+
+def force_fallback_to_numpy():
+    global xp, gpu_system
+    xp = import_with_fallback("numpy")
+    gpu_system = False
+    warnings.warn(
+        "Consider using a GPU-based system to greatly accelerate "
+        " generating groundtruths using cuVS."
+    )
+
+
+if rmm is not None:
+    gpu_system = True
+    try:
+        from pylibraft.common import DeviceResources
+        from rmm.allocators.cupy import rmm_cupy_allocator
+
+        from cuvs.neighbors.brute_force import build, search
+    except ImportError:
+        # RMM is available, cupy is available, but cuVS is not
+        force_fallback_to_numpy()
+else:
+    # No RMM, no cuVS, but cupy is available
+    force_fallback_to_numpy()
+
+def cpu_search(dataset, queries, k, metric="squeclidean"):
+    """
+    Find the k nearest neighbors for each query point in the dataset using the
+    specified metric.
+
+    Parameters
+    ----------
+    dataset : numpy.ndarray
+        An array of shape (n_samples, n_features) representing the dataset.
+    queries : numpy.ndarray
+        An array of shape (n_queries, n_features) representing the query
+        points.
+    k : int
+        The number of nearest neighbors to find.
+    metric : str, optional
+        The distance metric to use. Can be 'squeclidean' or 'inner_product'.
+        Default is 'squeclidean'.
+
+    Returns
+    -------
+    distances : numpy.ndarray
+        An array of shape (n_queries, k) containing the distances
+        (for 'squeclidean') or similarities
+        (for 'inner_product') to the k nearest neighbors for each query.
+    indices : numpy.ndarray
+        An array of shape (n_queries, k) containing the indices of the
+        k nearest neighbors in the dataset for each query.
+
+    """
+    if metric == "squeclidean":
+        diff = queries[:, xp.newaxis, :] - dataset[xp.newaxis, :, :]
+        dist_sq = xp.sum(diff**2, axis=2)  # Shape: (n_queries, n_samples)
+
+        indices = xp.argpartition(dist_sq, kth=k - 1, axis=1)[:, :k]
+        distances = xp.take_along_axis(dist_sq, indices, axis=1)
+
+        sorted_idx = xp.argsort(distances, axis=1)
+        distances = xp.take_along_axis(distances, sorted_idx, axis=1)
+        indices = xp.take_along_axis(indices, sorted_idx, axis=1)
+
+    elif metric == "inner_product":
+        similarities = xp.dot(
+            queries, dataset.T
+        )  # Shape: (n_queries, n_samples)
+
+        neg_similarities = -similarities
+        indices = xp.argpartition(neg_similarities, kth=k - 1, axis=1)[:, :k]
+        distances = xp.take_along_axis(similarities, indices, axis=1)
+
+        sorted_idx = xp.argsort(-distances, axis=1)
+
+    else:
+        raise ValueError(
+            "Unsupported metric in cuvs-bench-cpu. "
+            "Use 'squeclidean' or 'inner_product' or use the GPU package"
+            "to use any distance supported by cuVS."
+        )
+
+    distances = xp.take_along_axis(distances, sorted_idx, axis=1)
+    indices = xp.take_along_axis(indices, sorted_idx, axis=1)
+
+    return distances, indices
+
+
+def calc_truth(dataset, queries, k, metric="sqeuclidean", filter=None):
+    """
+    Calculate ground truth nearest neighbors with optional filtering.
+    
+    Parameters:
+    -----------
+    dataset : array-like
+        Reference vectors
+    queries : array-like
+        Query vectors
+    k : int
+        Number of nearest neighbors to find
+    metric : str
+        Distance metric to use
+    filter : object, optional
+        Filter object to apply during search
+    
+    Returns:
+    --------
+    tuple: (distances, indices)
+    """
+    queries = xp.asarray(queries, dtype=xp.float32)
+    dataset = xp.asarray(dataset, dtype=xp.float32)
+    
+    print("Building index for full dataset ({} vectors)...".format(dataset.shape[0]))
+    
+    if gpu_system:
+        resources = DeviceResources()
+        
+        try:
+            # Build index with full dataset
+            index = build(dataset, metric=metric)
+            
+            # Search with optional filter
+            print("Searching with full dataset...")
+            if filter is not None:
+                D, Ind = search(index, queries, k, prefilter=filter)
+            else:
+                D, Ind = search(index, queries, k)
+                
+            resources.sync()
+            
+            # Convert results back to CPU before returning
+            distances = xp.asnumpy(D)
+            indices = xp.asnumpy(Ind)
+            
+        finally:
+            # Clean up GPU memory
+            if 'index' in locals():
+                del index
+            del dataset, queries
+            mem_pool = xp.get_default_memory_pool()
+            mem_pool.free_all_blocks()
+            
+    else:
+        # CPU search doesn't support filters
+        if filter is not None:
+            print("Warning: Filters not supported in CPU implementation")
+        distances, indices = cpu_search(dataset, queries, k, metric=metric)
+
+    return distances, indices
